@@ -6,12 +6,19 @@ import (
 	"sync"
 	"encoding/json"
 	"os"
+	"time"
+	"strconv"
 )
 
 type KVStore struct {
-	data map[string]string
+	data map[string]KeyValue
 	mu sync.Mutex
 	filepath string
+}
+
+type KeyValue struct {
+	Value string
+	ExpiresAt time.Time
 }
 
 func (kv *KVStore) save() error {
@@ -43,32 +50,52 @@ func (kv *KVStore) get(w http.ResponseWriter, r *http.Request) {
 	var values []string
 	for _, key := range keys {
 		if val, exists := kv.data[key]; exists {
-			values = append(values, fmt.Sprintf("%s: %s", key, val))
+			if time.Now().After(val.ExpiresAt) {
+				delete(kv.data, key)
+				continue
+			}
+			values = append(values, fmt.Sprintf("%s: %s", key, val.Value))
 		}
 	}
 
 	fmt.Fprintf(w, "%v", values)
  }
 
-func (kv *KVStore) put(w http.ResponseWriter, r *http.Request) {
-	key := r.URL.Query().Get("key")
-	value := r.URL.Query().Get("value")
+ func (kv *KVStore) put(w http.ResponseWriter, r *http.Request) {
+    key := r.URL.Query().Get("key")
+    value := r.URL.Query().Get("value")
+    ttl := r.URL.Query().Get("ttl")
+    defaultTTL := 86400 * 30 // 1 month
+    var ttlSeconds int
 
-	if key == "" || value == "" {
-		http.Error(w, "missing key or value", http.StatusBadRequest)
-		return
-	}
+    if key == "" || value == "" {
+        http.Error(w, "missing key or value", http.StatusBadRequest)
+        return
+    }
 
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+    if ttl == "" {
+        ttlSeconds = defaultTTL
+        fmt.Printf("missing ttl, using default %d seconds\n", defaultTTL)
+    } else {
+        ttlSeconds, _ = strconv.Atoi(ttl)
+    }
 
-	kv.data[key] = value
-	if err := kv.save(); err != nil {
+    kv.mu.Lock()
+    defer kv.mu.Unlock()
+    
+    expiresAt := time.Now().Add(time.Duration(ttlSeconds) * time.Second)
+    kv.data[key] = KeyValue{
+        Value: value,
+        ExpiresAt: expiresAt,
+    }
+
+    if err := kv.save(); err != nil {
         http.Error(w, "error saving data", http.StatusInternalServerError)
         return
     }
-	w.WriteHeader(http.StatusCreated)
-	fmt.Fprintf(w, "key %s added successfully", key)
+    
+    w.WriteHeader(http.StatusCreated)
+    fmt.Fprintf(w, "key %s added successfully", key)
 }
 
 func (kv *KVStore) delete(w http.ResponseWriter, r *http.Request) {
@@ -102,11 +129,21 @@ func homepage(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "TODO: add usage\n")	
 }
 
+func (kv *KVStore) cleanExpired() {
+    for k, v := range kv.data {
+        if time.Now().After(v.ExpiresAt) {
+            delete(kv.data, k)
+        }
+    }
+}
+
 func main() {
     kv := &KVStore{
-        data: make(map[string]string),
+        data: make(map[string]KeyValue),
 		filepath: "store.json",
     }
+
+	kv.cleanExpired()
 
 	if err := kv.load(); err != nil {
 		fmt.Printf("No existing data found: %v\n", err)
